@@ -2,3 +2,5 @@
 *.rst	eol=lf
 *.md	eol=lf
 *.mdx   eol=lf
+data/sample_train.txt filter=lfs diff=lfs merge=lfs -text
+data/sample_val.txt filter=lfs diff=lfs merge=lfs -text
