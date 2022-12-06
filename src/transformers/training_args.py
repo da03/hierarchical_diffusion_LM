@@ -1407,6 +1407,7 @@ class TrainingArguments:
                 raise ImportError("--deepspeed requires deepspeed: `pip install deepspeed`.")
             import deepspeed
 
+            #deepspeed.init_distributed('gloo')
             deepspeed.init_distributed()
 
             # workaround for setups like notebooks where the launcher can't be used,

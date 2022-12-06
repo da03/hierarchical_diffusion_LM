@@ -3123,6 +3123,14 @@ class Trainer:
         new_tensor[:, : old_size[1]] = tensor
         return new_tensor
 
+    def make_contiguous(self, tensor):
+        if tensor is None:
+            return None
+        if isinstance(tensor, (list, tuple)):
+            return tuple(self.make_contiguous(t) for t in tensor)
+        else:
+            return tensor.contiguous()
+
     def prediction_step(
         self,
         model: nn.Module,
@@ -3160,6 +3168,8 @@ class Trainer:
                 ignore_keys = getattr(self.model.config, "keys_to_ignore_at_inference", [])
             else:
                 ignore_keys = []
+        if prediction_loss_only:
+            ignore_keys.append('logits')
 
         # labels may be popped when computing the loss (label smoothing for instance) so we grab them first.
         if has_labels:
@@ -3197,6 +3207,7 @@ class Trainer:
 
                     if isinstance(outputs, dict):
                         logits = tuple(v for k, v in outputs.items() if k not in ignore_keys + ["loss"])
+                        logits= self.make_contiguous(logits)
                     else:
                         logits = outputs[1:]
                 else:

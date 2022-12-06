@@ -33,6 +33,10 @@ from ...modeling_utils import PreTrainedModel
 from ...utils import logging
 from .configuration_gpt_neox import GPTNeoXConfig
 
+try:
+    import deepspeed
+except ImportError:
+    pass
 
 logger = logging.get_logger(__name__)
 
@@ -98,6 +102,12 @@ class GPTNeoXAttention(nn.Module):
         self.query_key_value = nn.Linear(config.hidden_size, 3 * config.hidden_size)
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
 
+        self.use_deepspeed_checkpointing = config.use_deepspeed_checkpointing
+        #self.use_deepspeed_checkpointing = False
+        #print ('='*10)
+        #print (self.use_deepspeed_checkpointing)
+        #assert self.use_deepspeed_checkpointing
+
     def forward(
         self,
         hidden_states,
@@ -112,7 +122,10 @@ class GPTNeoXAttention(nn.Module):
         # Compute QKV
         # Attention heads [batch, seq_len, hidden_size]
         #   --> [batch, seq_len, (np * 3 * head_size)]
-        qkv = self.query_key_value(hidden_states)
+        if self.use_deepspeed_checkpointing:
+            qkv = deepspeed.checkpointing.checkpoint(self.query_key_value, hidden_states)
+        else:
+            qkv = self.query_key_value(hidden_states)
 
         # [batch, seq_len, (num_heads * 3 * head_size)]
         #   --> [batch, seq_len, num_heads, 3 * head_size]
@@ -147,14 +160,22 @@ class GPTNeoXAttention(nn.Module):
             past_value = layer_past[1]
             key = torch.cat((past_key, key), dim=-2)
             value = torch.cat((past_value, value), dim=-2)
+        assert not use_cache
         present = (key, value) if use_cache else None
 
         # Compute attention
-        attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
+        if self.use_deepspeed_checkpointing:
+            attn_output, attn_weights = deepspeed.checkpointing.checkpoint(self._attn, query, key, value, attention_mask, head_mask)
+        else:
+            attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
 
         # Reshape outputs
         attn_output = self._merge_heads(attn_output, self.num_attention_heads, self.head_size)
-        attn_output = self.dense(attn_output)
+        if self.use_deepspeed_checkpointing:
+            attn_output = deepspeed.checkpointing.checkpoint(self.dense, attn_output)
+        else:
+            #assert False
+            attn_output = self.dense(attn_output)
 
         outputs = (attn_output, present)
         if output_attentions:
@@ -305,6 +326,7 @@ class GPTNeoXLayer(nn.Module):
         self.post_attention_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.attention = GPTNeoXAttention(config)
         self.mlp = GPTNeoXMLP(config)
+        self.use_deepspeed_checkpointing = config.use_deepspeed_checkpointing
 
     def forward(
         self,
@@ -315,15 +337,21 @@ class GPTNeoXLayer(nn.Module):
         layer_past=None,
         output_attentions=False,
     ):
+        ln_out = self.input_layernorm(hidden_states)
 
-        attention_layer_outputs = self.attention(
-            self.input_layernorm(hidden_states),
-            attention_mask=attention_mask,
-            layer_past=layer_past,
-            head_mask=head_mask,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-        )
+        if False and self.use_deepspeed_checkpointing:
+            attention_layer_outputs = deepspeed.checkpointing.checkpoint(self.attention, ln_out, attention_mask,
+            head_mask,
+            layer_past, use_cache, output_attentions)
+        else:
+            attention_layer_outputs = self.attention(
+                ln_out,
+                attention_mask=attention_mask,
+                layer_past=layer_past,
+                head_mask=head_mask,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+            )
         attn_output = attention_layer_outputs[0]  # output_attn: attn_output, present, (attn_weights)
         outputs = attention_layer_outputs[1:]
 
@@ -442,6 +470,7 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
         self,
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
+        seq_cl_feats: Optional[torch.FloatTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
@@ -511,6 +540,9 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
             inputs_embeds = self.embed_in(input_ids)
 
         hidden_states = inputs_embeds
+        #import pdb; pdb.set_trace()
+        if seq_cl_feats is not None:
+            hidden_states = hidden_states + seq_cl_feats
 
         presents = () if use_cache else None
         all_attentions = () if output_attentions else None
@@ -576,6 +608,11 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel):
         self,
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
+        chunk_ids: Optional[torch.LongTensor] = None,
+        chunk_input_ids: Optional[torch.LongTensor] = None,
+        chunk_attn_mask: Optional[torch.FloatTensor] = None,
+        cl_feats: Optional[torch.FloatTensor] = None,
+        past_seq_cl_feats: Optional[torch.FloatTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
         past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
@@ -625,10 +662,58 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel):
         >>> prediction_logits = outputs.logits
         ```"""
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        #import pdb; pdb.set_trace()
+        #chunk_ids: Optional[torch.LongTensor] = None, bsz, len
+        #chunk_input_ids: Optional[torch.LongTensor] = None, bsz, num_chunks, len
+        #chunk_attn_mask: Optional[torch.FloatTensor] = None, bsz, num_chunks, len
+        if chunk_ids is not None:
+            bsz = chunk_ids.shape[0]
+            l = chunk_ids.shape[1]
+            num_chunks = chunk_input_ids.shape[1]
+            chunk_size = chunk_input_ids.shape[-1]
+            chunk_input_ids = chunk_input_ids.view(-1, chunk_size)
+            chunk_attn_mask = chunk_attn_mask.view(-1, chunk_size)
+            with torch.no_grad():
+                train_cl_feats = self.cl_model.forward(input_ids=chunk_input_ids, attention_mask=chunk_attn_mask)
+            train_cl_feats = train_cl_feats.view(bsz, num_chunks, -1)
+            train_cl_feats = self.proj_model(train_cl_feats)
+            hidden_dim = train_cl_feats.shape[-1]
+            #seq_cl_feats = cl_feats.new_zeros(bsz, l, hidden_dim)
+            chunk_ids = chunk_ids.view(bsz, l, 1).expand(-1, -1, hidden_dim)
+            seq_cl_feats = train_cl_feats.gather(1, chunk_ids)
+        else:
+            seq_cl_feats = None
+        #import pdb; pdb.set_trace()
+        if cl_feats is not None:
+            ###assert False
+            if input_ids.shape[1] > 1:
+                assert past_seq_cl_feats is not None
+            else:
+                past_seq_cl_feats = None
+            bsz = input_ids[:, -1:].shape[0]
+            if input_ids[:, -1:].eq(2).any():
+                self.chunk_id += 1
+                self.chunk_offset = 0
+                for b in range(bsz):
+                    if input_ids[:, -1:][b].item() == 2:
+                        self.chunk_ids[b] += 1
+                        if self.chunk_ids[b] >= cl_feats.shape[1]:
+                            self.chunk_ids[b] = cl_feats.shape[1]-1
+            seq_cl_feats = torch.stack([cl_feats[b, self.chunk_ids[b]] for b in range(bsz)], dim=0).unsqueeze(1)
+            if past_seq_cl_feats is not None:
+                #import pdb; pdb.set_trace()
+                seq_cl_feats = torch.cat((past_seq_cl_feats, seq_cl_feats), dim=1)
+            self.chunk_offset += 1
+            if seq_cl_feats is not None:
+                if self.past_seq_cl_feats is None:
+                    self.past_seq_cl_feats = seq_cl_feats
+                else:
+                    self.past_seq_cl_feats = torch.cat((self.past_seq_cl_feats, seq_cl_feats), dim=1)
 
         outputs = self.gpt_neox(
             input_ids,
             attention_mask=attention_mask,
+            seq_cl_feats=seq_cl_feats,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
             past_key_values=past_key_values,
@@ -640,6 +725,20 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel):
 
         hidden_states = outputs[0]
         lm_logits = self.embed_out(hidden_states)
+        #lm_logits = lm_logits.contiguous()
+        if cl_feats is not None and (not self.training):
+            ###assert False
+            assert not self.training
+            disallow_ids = [0, 1, 3, 4]  # see ../../../../for_yuntian/codon_wordlevel_100vocab_added.json
+            for disallow_id in disallow_ids:
+                lm_logits[:, :, disallow_id] = -float('inf')
+            if self.chunk_id < 20:
+                if self.chunk_offset != 512+1:
+                    lm_logits[:, :, 2] = -float('inf')
+                else:
+                    #import pdb; pdb.set_trace()
+                    lm_logits[:, :, :] = -float('inf')
+                    lm_logits[:, :, 2] = 0
 
         lm_loss = None
         if labels is not None:
@@ -648,6 +747,8 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel):
             labels = labels[:, 1:].contiguous()
             loss_fct = CrossEntropyLoss()
             lm_loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), labels.view(-1))
+            ###TODO if not self.training:
+            ###TODO     lm_logits = None
 
         if not return_dict:
             output = (lm_logits,) + outputs[1:]
@@ -661,7 +762,8 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel):
             attentions=outputs.attentions,
         )
 
-    def prepare_inputs_for_generation(self, input_ids, past=None, attention_mask=None, **model_kwargs):
+    #def prepare_inputs_for_generation(self, input_ids, past=None, attention_mask=None, **model_kwargs):
+    def prepare_inputs_for_generation(self, input_ids, past=None, attention_mask=None, **kwargs):
         input_shape = input_ids.shape
 
         # if model is used as a decoder in encoder-decoder model, the decoder attention mask is created on the fly
@@ -672,7 +774,13 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel):
         if past and past[0] is not None:
             input_ids = input_ids[:, -1:]
 
-        return {"input_ids": input_ids, "attention_mask": attention_mask, "past_key_values": past}
+        result = {"input_ids": input_ids, "attention_mask": attention_mask, "past_key_values": past}
+        if 'cl_feats' in kwargs:
+            result['cl_feats']= kwargs['cl_feats']
+        if 'past_seq_cl_feats' in kwargs:
+            result['past_seq_cl_feats']= kwargs['past_seq_cl_feats']
+
+        return result
 
     def _reorder_cache(self, past, beam_idx):
         reordered_past = ()
