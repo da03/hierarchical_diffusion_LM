@@ -1,4 +1,4 @@
-# Diffusion-based hierarchical modeling.
+# Diffusion-based hierarchical language modeling.
 
 ## Dependencies
 
